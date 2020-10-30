@@ -17,7 +17,7 @@ const (
 
 type Call struct {
 	done chan string
-	err  error
+	Err  error
 }
 
 func (c *Call) Done() string {
@@ -69,8 +69,9 @@ func parseAddr(addr string) (network, address string) {
 
 func (cli *Client) ParseReply() {
 	var err error
+	var rep []byte
 	for err == nil {
-		rep, err := cli.FrameConn.ReadFrame()
+		rep, err = cli.FrameConn.ReadFrame()
 		if err != nil {
 			break
 		}
@@ -168,7 +169,7 @@ func (cli *Client) AsyncCall(req string) *Call {
 	reqMsg := cli.makeReq(req)
 	err := cli.FrameConn.WriteFrame([]byte(reqMsg))
 	if err != nil {
-		call.err = err
+		call.Err = err
 		call.done <- err.Error()
 	}
 

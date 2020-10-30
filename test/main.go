@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/smallnest/goframe"
 	"github.com/supermario1990/gnet_client"
+	"time"
 )
 
 func main() {
@@ -30,11 +31,23 @@ func main() {
 	}
 	fc := goframe.NewLengthFieldBasedFrameConn(encoderConfig, decoderConfig, cli.Conn)
 	cli.Init(fc)
+	defer cli.Close()
 
-	rep, _ := cli.SyncCall("hello")
-	fmt.Println(string(rep))
+	for {
+		rep, err := cli.SyncCall("hello")
+		if err != nil {
+			fmt.Println(err)
+			return
+		}
+		fmt.Println(string(rep))
 
-	call := cli.AsyncCall("hello")
-	rep1 := call.Done()
-	fmt.Println(rep1)
+		call := cli.AsyncCall("hello")
+		if call.Err != nil {
+			fmt.Println(err)
+			return
+		}
+		rep1 := call.Done()
+		fmt.Println(rep1)
+		time.Sleep(time.Second)
+	}
 }
