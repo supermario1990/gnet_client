@@ -37,17 +37,22 @@ func main() {
 		rep, err := cli.SyncCall("hello")
 		if err != nil {
 			fmt.Println(err)
-			return
+			continue
 		}
 		fmt.Println(string(rep))
 
 		call := cli.AsyncCall("hello")
 		if call.Err != nil {
 			fmt.Println(err)
-			return
+			continue
 		}
-		rep1 := call.Done()
-		fmt.Println(rep1)
+		select {
+		case rep1 := <-call.Done:
+			fmt.Println(rep1)
+		case <-cli.Quit.Done:
+			fmt.Println(cli.Quit.Err)
+		}
+
 		time.Sleep(time.Second)
 	}
 }
