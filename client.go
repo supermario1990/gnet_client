@@ -14,7 +14,7 @@ import (
 
 const (
 	defaultTimeout   = time.Second * 10
-	heartbeatTimeout = time.Second * 6
+	heartbeatTimeout = time.Second * 10
 )
 
 // 基于文本的消息协议
@@ -56,6 +56,8 @@ type Client struct {
 	Quit          *Call
 	heartbeatTime time.Time
 	status        atomic.Int32
+	encodeConfig  goframe.EncoderConfig
+	decodeConfig  goframe.DecoderConfig
 }
 type Option func(*Client)
 
@@ -95,6 +97,14 @@ func (cli *Client) heartbeatGo() {
 		<-t.C
 		heartbeatMsg := "0 " + MSG_TYPE_HEARTBEAT + " ok"
 		cli.FrameConn.WriteFrame([]byte(heartbeatMsg))
+
+		// 心跳超时了
+		if cli.heartbeatTime.Add(heartbeatTimeout).Before(time.Now()) {
+			fmt.Println("心跳超时，无法连接服务器")
+			if err := cli.Close(); err != nil {
+				panic(err)
+			}
+		}
 	}
 }
 
@@ -103,13 +113,17 @@ func (cli *Client) reConn() {
 	for {
 		<-t.C
 		if cli.status.Load() == STATUS_CLOSED {
-			fmt.Println("reconnect to server:", cli.address)
+			cli.mutex.Lock()
+			fmt.Println("开始重连", cli.address)
 			err := cli.connect()
 			if err != nil {
-				fmt.Println("reconnect failed:", err)
+				fmt.Println("重连失败:", err)
 			} else {
-				cli.status.Store(STATUS_CONNECTED)
+				fmt.Println("重连成功")
+				cli.FrameConn = goframe.NewLengthFieldBasedFrameConn(cli.encodeConfig, cli.decodeConfig, cli.Conn)
 			}
+			cli.mutex.Unlock()
+
 		}
 	}
 }
@@ -117,12 +131,12 @@ func (cli *Client) reConn() {
 func (cli *Client) ParseReply() {
 	var err error
 	var rep []byte
-	for err == nil {
+	for {
 		rep, err = cli.FrameConn.ReadFrame()
 		if err != nil {
 			cli.Quit.Err = err
 			cli.Quit.Done <- ""
-			break
+			continue
 		}
 		rs := strings.SplitN(string(rep), " ", 3)
 		if len(rs) == 3 {
@@ -136,13 +150,6 @@ func (cli *Client) ParseReply() {
 				call.Done <- msg
 			case MSG_TYPE_HEARTBEAT:
 				fmt.Println("receive heartbeat message")
-				// 心跳超时了
-				if cli.heartbeatTime.Add(heartbeatTimeout).Before(time.Now()) {
-					fmt.Println("server is shutdown")
-					if err := cli.Close(); err != nil {
-						panic(err)
-					}
-				}
 				cli.heartbeatTime = time.Now()
 			default:
 				fmt.Println("receive wrong message type:", msgType)
@@ -152,9 +159,6 @@ func (cli *Client) ParseReply() {
 			cli.Quit.Err = err
 			cli.Quit.Done <- ""
 		}
-	}
-	if err != nil {
-		fmt.Println(err)
 	}
 }
 
@@ -199,15 +203,18 @@ func (cli *Client) connect() error {
 	return nil
 }
 
-func (cli *Client) Init(fc goframe.FrameConn) {
+func (cli *Client) Init(encode goframe.EncoderConfig, decode goframe.DecoderConfig) {
 	cli.mutex.Lock()
 	defer cli.mutex.Unlock()
 	if cli.init {
 		return
 	}
-	cli.FrameConn = fc
-	go cli.ParseReply()
+	cli.encodeConfig = encode
+	cli.decodeConfig = decode
+	cli.FrameConn = goframe.NewLengthFieldBasedFrameConn(cli.encodeConfig, cli.decodeConfig, cli.Conn)
 	cli.init = true
+
+	go cli.ParseReply()
 
 	if cli.reconnect {
 		go cli.reConn()
@@ -224,12 +231,12 @@ func (cli *Client) makeReq(req string) string {
 
 // SyncCall send to server synchronously
 func (cli *Client) SyncCall(req string) ([]byte, error) {
-	cli.mutex.Lock()
-	defer cli.mutex.Unlock()
 
 	if cli.status.Load() != STATUS_CONNECTED {
 		return nil, errors.New("connect failed")
 	}
+
+	cli.mutex.Lock()
 
 	call := new(Call)
 	call.Done = make(chan string, 1)
@@ -238,6 +245,7 @@ func (cli *Client) SyncCall(req string) ([]byte, error) {
 	cli.msgPending[cli.seq] = call
 	reqMsg := cli.makeReq(req)
 	err := cli.FrameConn.WriteFrame([]byte(reqMsg))
+	cli.mutex.Unlock()
 	if err != nil {
 		return nil, err
 	}
@@ -252,20 +260,20 @@ func (cli *Client) SyncCall(req string) ([]byte, error) {
 
 // AsyncCall send to server asynchronously
 func (cli *Client) AsyncCall(req string) *Call {
-	cli.mutex.Lock()
-	defer cli.mutex.Unlock()
 
 	call := new(Call)
 	if cli.status.Load() != STATUS_CONNECTED {
 		call.Err = errors.New("connect failed")
 		return call
 	}
+	cli.mutex.Lock()
 	call.Done = make(chan string, 1)
 
 	cli.seq++
 	cli.msgPending[cli.seq] = call
 	reqMsg := cli.makeReq(req)
 	err := cli.FrameConn.WriteFrame([]byte(reqMsg))
+	cli.mutex.Unlock()
 	if err != nil {
 		call.Err = err
 		call.Done <- err.Error()
@@ -278,6 +286,10 @@ func (cli *Client) AsyncCall(req string) *Call {
 func (cli *Client) Close() error {
 	cli.mutex.Lock()
 	defer cli.mutex.Unlock()
+	if cli.status.Load() == STATUS_CLOSED {
+		return nil
+	}
+
 	if err := cli.Conn.Close(); err != nil {
 		fmt.Println("close connection failed:", err)
 		return err

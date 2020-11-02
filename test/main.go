@@ -29,21 +29,22 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	fc := goframe.NewLengthFieldBasedFrameConn(encoderConfig, decoderConfig, cli.Conn)
-	cli.Init(fc)
+	cli.Init(encoderConfig, decoderConfig)
 	defer cli.Close()
 
 	for {
 		rep, err := cli.SyncCall("hello")
 		if err != nil {
-			fmt.Println(err)
+			fmt.Println("SyncCall", err)
+			time.Sleep(time.Second)
 			continue
 		}
 		fmt.Println(string(rep))
 
 		call := cli.AsyncCall("hello")
 		if call.Err != nil {
-			fmt.Println(err)
+			fmt.Println("AsyncCall", err)
+			time.Sleep(time.Second)
 			continue
 		}
 		select {
