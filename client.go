@@ -3,12 +3,11 @@ package gnet_client
 import (
 	"errors"
 	"fmt"
+	"github.com/sasha-s/go-deadlock"
 	"github.com/smallnest/goframe"
-	"go.uber.org/atomic"
 	"net"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -32,8 +31,10 @@ const (
 	MSG_TYPE_HEARTBEAT = "2" // 心跳消息 序号为0
 )
 
+type status int
+
 const (
-	STATUS_CONNECTED int32 = iota
+	STATUS_CONNECTED status = iota
 	STATUS_CLOSED
 )
 
@@ -49,13 +50,13 @@ type Client struct {
 	heartbeat     bool              // 是否支持心跳
 	timeout       time.Duration     // 超时时间
 	FrameConn     goframe.FrameConn // tcp组包拆包接口
-	mutex         sync.Mutex        // 锁
+	mutex         deadlock.Mutex    // 锁
 	seq           uint64            // 消息序号
 	msgPending    map[uint64]*Call
 	init          bool
 	Quit          *Call
 	heartbeatTime time.Time
-	status        atomic.Int32
+	connStatus    status
 	encodeConfig  goframe.EncoderConfig
 	decodeConfig  goframe.DecoderConfig
 }
@@ -79,6 +80,18 @@ func WithTimeout(timeout time.Duration) Option {
 	}
 }
 
+func WithEncode(encode goframe.EncoderConfig) Option {
+	return func(client *Client) {
+		client.encodeConfig = encode
+	}
+}
+
+func WithDecode(decode goframe.DecoderConfig) Option {
+	return func(client *Client) {
+		client.decodeConfig = decode
+	}
+}
+
 func parseAddr(addr string) (network, address string) {
 	network = "tcp"
 	address = strings.ToLower(addr)
@@ -95,8 +108,14 @@ func (cli *Client) heartbeatGo() {
 	t := time.NewTicker(time.Second * 3)
 	for {
 		<-t.C
+
+		if cli.getStatus() == STATUS_CLOSED {
+			continue
+		}
 		heartbeatMsg := "0 " + MSG_TYPE_HEARTBEAT + " ok"
+		cli.mutex.Lock()
 		cli.FrameConn.WriteFrame([]byte(heartbeatMsg))
+		cli.mutex.Unlock()
 
 		// 心跳超时了
 		if cli.heartbeatTime.Add(heartbeatTimeout).Before(time.Now()) {
@@ -112,18 +131,14 @@ func (cli *Client) reConn() {
 	t := time.NewTicker(time.Second * 1)
 	for {
 		<-t.C
-		if cli.status.Load() == STATUS_CLOSED {
-			cli.mutex.Lock()
+		if cli.getStatus() == STATUS_CLOSED {
 			fmt.Println("开始重连", cli.address)
 			err := cli.connect()
 			if err != nil {
 				fmt.Println("重连失败:", err)
 			} else {
 				fmt.Println("重连成功")
-				cli.FrameConn = goframe.NewLengthFieldBasedFrameConn(cli.encodeConfig, cli.decodeConfig, cli.Conn)
 			}
-			cli.mutex.Unlock()
-
 		}
 	}
 }
@@ -132,10 +147,16 @@ func (cli *Client) ParseReply() {
 	var err error
 	var rep []byte
 	for {
+		status := cli.getStatus()
+		fmt.Println("接受协程:", status)
+		if status == STATUS_CLOSED {
+			time.Sleep(time.Second)
+			continue
+		}
 		rep, err = cli.FrameConn.ReadFrame()
 		if err != nil {
-			cli.Quit.Err = err
-			cli.Quit.Done <- ""
+			fmt.Println("接受数据失败：", err)
+			close(cli.Quit.Done)
 			continue
 		}
 		rs := strings.SplitN(string(rep), " ", 3)
@@ -149,15 +170,13 @@ func (cli *Client) ParseReply() {
 				call := cli.msgPending[req]
 				call.Done <- msg
 			case MSG_TYPE_HEARTBEAT:
-				fmt.Println("receive heartbeat message")
+				fmt.Println("收到心跳消息")
 				cli.heartbeatTime = time.Now()
 			default:
-				fmt.Println("receive wrong message type:", msgType)
+				fmt.Println("收到错误的消息类型:", msgType)
 			}
 		} else {
-			err = errors.New("wrong reply format:" + string(rep))
-			cli.Quit.Err = err
-			cli.Quit.Done <- ""
+			fmt.Println("收到错误的消息格式:", string(rep))
 		}
 	}
 }
@@ -182,11 +201,12 @@ func NewCilent(addr string, ops ...Option) (*Client, error) {
 	cli.msgPending = make(map[uint64]*Call)
 	cli.Quit = new(Call)
 	cli.Quit.Done = make(chan string, 1)
-	cli.heartbeatTime = time.Now()
 	return cli, nil
 }
 
 func (cli *Client) connect() error {
+	cli.mutex.Lock()
+	defer cli.mutex.Unlock()
 	network, address := parseAddr(cli.address)
 	conn, err := net.DialTimeout(network, address, cli.timeout)
 	if err != nil {
@@ -199,19 +219,18 @@ func (cli *Client) connect() error {
 	}
 
 	cli.Conn = conn
-	cli.status.Store(STATUS_CONNECTED)
+	cli.FrameConn = goframe.NewLengthFieldBasedFrameConn(cli.encodeConfig, cli.decodeConfig, cli.Conn)
+	cli.ChangeStatus(STATUS_CONNECTED)
+	cli.heartbeatTime = time.Now()
 	return nil
 }
 
-func (cli *Client) Init(encode goframe.EncoderConfig, decode goframe.DecoderConfig) {
+func (cli *Client) Init() {
 	cli.mutex.Lock()
 	defer cli.mutex.Unlock()
 	if cli.init {
 		return
 	}
-	cli.encodeConfig = encode
-	cli.decodeConfig = decode
-	cli.FrameConn = goframe.NewLengthFieldBasedFrameConn(cli.encodeConfig, cli.decodeConfig, cli.Conn)
 	cli.init = true
 
 	go cli.ParseReply()
@@ -232,20 +251,19 @@ func (cli *Client) makeReq(req string) string {
 // SyncCall send to server synchronously
 func (cli *Client) SyncCall(req string) ([]byte, error) {
 
-	if cli.status.Load() != STATUS_CONNECTED {
-		return nil, errors.New("connect failed")
+	if cli.getStatus() != STATUS_CONNECTED {
+		return nil, errors.New("SyncCall 连接处于断开状态")
 	}
 
 	cli.mutex.Lock()
-
 	call := new(Call)
 	call.Done = make(chan string, 1)
-
 	cli.seq++
 	cli.msgPending[cli.seq] = call
 	reqMsg := cli.makeReq(req)
 	err := cli.FrameConn.WriteFrame([]byte(reqMsg))
 	cli.mutex.Unlock()
+
 	if err != nil {
 		return nil, err
 	}
@@ -259,41 +277,51 @@ func (cli *Client) SyncCall(req string) ([]byte, error) {
 }
 
 // AsyncCall send to server asynchronously
-func (cli *Client) AsyncCall(req string) *Call {
+func (cli *Client) AsyncCall(req string) (*Call, error) {
 
 	call := new(Call)
-	if cli.status.Load() != STATUS_CONNECTED {
-		call.Err = errors.New("connect failed")
-		return call
-	}
-	cli.mutex.Lock()
 	call.Done = make(chan string, 1)
+	if cli.getStatus() != STATUS_CONNECTED {
+		return call, errors.New("AsyncCall 连接处于断开状态")
+	}
 
+	cli.mutex.Lock()
 	cli.seq++
 	cli.msgPending[cli.seq] = call
 	reqMsg := cli.makeReq(req)
 	err := cli.FrameConn.WriteFrame([]byte(reqMsg))
 	cli.mutex.Unlock()
+
 	if err != nil {
 		call.Err = err
 		call.Done <- err.Error()
 	}
 
-	return call
+	return call, nil
 }
 
 // Close close cli
 func (cli *Client) Close() error {
-	cli.mutex.Lock()
-	defer cli.mutex.Unlock()
-	if cli.status.Load() == STATUS_CLOSED {
+
+	if cli.getStatus() == STATUS_CLOSED {
 		return nil
 	}
 
+	cli.mutex.Lock()
 	if err := cli.Conn.Close(); err != nil {
-		fmt.Println("close connection failed:", err)
+		fmt.Println("关闭连接失败:", err)
+		cli.mutex.Unlock()
 		return err
 	}
-	cli.status.Store(STATUS_CLOSED)
+	cli.ChangeStatus(STATUS_CLOSED)
+	cli.mutex.Unlock()
+
 	return nil
+}
+
+func (cli *Client) ChangeStatus(s status) {
+	cli.connStatus = s
+}
+func (cli *Client) getStatus() status {
+	return cli.connStatus
 }
