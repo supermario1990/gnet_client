@@ -1,64 +1,43 @@
 package main
 
 import (
-	"encoding/binary"
 	"fmt"
-	"github.com/smallnest/goframe"
 	"github.com/supermario1990/gnet_client"
-	"net/http"
-	_ "net/http/pprof"
-	"time"
+	"log"
 )
 
+type Args struct {
+	A, B int
+}
+
+type Quotient struct {
+	Quo, Rem int
+}
+
 func main() {
-
-	encoderConfig := goframe.EncoderConfig{
-		ByteOrder:                       binary.BigEndian,
-		LengthFieldLength:               4,
-		LengthAdjustment:                0,
-		LengthIncludesLengthFieldLength: false,
-	}
-
-	decoderConfig := goframe.DecoderConfig{
-		ByteOrder:           binary.BigEndian,
-		LengthFieldOffset:   0,
-		LengthFieldLength:   4,
-		LengthAdjustment:    0,
-		InitialBytesToStrip: 4,
-	}
-
-	cli, err := gnet_client.NewCilent("tcp://127.0.0.1:9000",
-		gnet_client.WithEncode(encoderConfig),
-		gnet_client.WithDecode(decoderConfig))
+	client, err := gnet_client.DialHTTP("tcp", "127.0.0.1:1234")
 	if err != nil {
-		panic(err)
+		log.Fatal("dialing:", err)
 	}
-	cli.Init()
-	defer cli.Close()
 
-	go http.ListenAndServe("0.0.0.0:6060", nil)
 	for {
-		rep, err := cli.SyncCall("hello")
+		// Synchronous call
+		args := &Args{7, 8}
+		var reply int
+		err = client.Call("Arith.Multiply", args, &reply)
 		if err != nil {
-			fmt.Println("SyncCall", err)
-			time.Sleep(time.Second)
-			continue
+			fmt.Println("arith error:", err)
 		}
-		fmt.Println(string(rep))
+		fmt.Printf("Arith: %d*%d=%d\n", args.A, args.B, reply)
 
-		call, err := cli.AsyncCall("hello")
-		if err != nil {
-			fmt.Println("AsyncCall", err)
-			time.Sleep(time.Second)
-			continue
-		} else {
-			select {
-			case rep1 := <-call.Done:
-				fmt.Println(rep1)
-			case <-cli.Quit.Done:
-			}
+		// Asynchronous call
+		quotient := new(Quotient)
+		divCall := client.Go("Arith.Divide", args, quotient, nil)
+		replyCall := <-divCall.Done // will be equal to divCall
+		if replyCall.Error != nil {
+			fmt.Println("arith error:", replyCall.Error)
 		}
-
-		time.Sleep(time.Second)
+		fmt.Printf("Arith: %d/%d=%d...%d", args.A, args.B, quotient.Quo, quotient.Rem)
+		// check errors, print, etc.
 	}
 }
